@@ -5,6 +5,9 @@
 
 #include <nlohmann/json.hpp>
 #include <utf8proc/utf8proc.h>
+#ifdef INGINE_WITH_TOKS
+#include <toks.h>
+#endif
 
 #include <algorithm>
 #include <fstream>
@@ -14,6 +17,14 @@
 #include <stdexcept>
 
 namespace ingine::text {
+#ifdef INGINE_WITH_TOKS
+// One toks context per Tokenizer. Read-only after load, so it is shared by every copy of the Tokenizer and by all
+// threads; the scratch below is per thread.
+struct ToksBackend {
+  toks_ctx* ctx = nullptr;
+  ~ToksBackend() { toks_unload(ctx); }
+};
+#endif
 namespace {
 
 using Json = nlohmann::json;
@@ -340,6 +351,20 @@ Tokenizer Tokenizer::from_json(std::string_view tokenizer_json) {
     if (it == by_symbol.end()) throw std::invalid_argument("tokenizer.json: byte token missing");
     tok.byte_ids_[static_cast<std::size_t>(b)] = it->second;
   }
+#ifdef INGINE_WITH_TOKS
+  // Optional fast path. Any failure leaves toks_ null and the native encoder does the work.
+  {
+    auto backend = std::make_shared<ToksBackend>();
+    toks_diag diag{};
+    toks_load_opts opts{};
+    opts.size = sizeof(opts);
+    opts.tier = TOKS_TIER_AUTO;
+    opts.diag = &diag;
+    if (toks_load_mem_copy(&backend->ctx, tokenizer_json.data(), tokenizer_json.size(), &opts) == 0) {
+      tok.toks_ = std::move(backend);
+    }
+  }
+#endif
   return tok;
 }
 
@@ -392,6 +417,9 @@ void Tokenizer::encode_piece(std::string_view piece, std::vector<int32_t>& ids) 
 
 void Tokenizer::encode_ordinary(std::string_view text, std::vector<int32_t>& ids) const {
   if (text.empty()) return;
+#ifdef INGINE_WITH_TOKS
+  if (toks_ && toks_ordinary(text, ids)) return;
+#endif
   const auto spans = uni::utf8_codepoints(text, "Tokenizer::encode input");
   std::vector<std::int32_t> cps(spans.size());
   std::vector<std::uint16_t> cls(spans.size());
@@ -465,5 +493,37 @@ std::optional<int32_t> Tokenizer::token_id(std::string_view added_token) const {
   if (it == added_by_content_.end()) return std::nullopt;
   return it->second;
 }
+
+#ifdef INGINE_WITH_TOKS
+bool Tokenizer::toks_ordinary(std::string_view text, std::vector<int32_t>& ids) const {
+  // The native encoder rejects invalid UTF-8; keep that contract instead of toks' byte fallback.
+  (void)unicode::utf8_codepoints(text, "Tokenizer::encode input");
+  // A scratch belongs to one thread; growing it re-binds it to this context. toks does no allocation itself.
+  static thread_local std::vector<unsigned char> scratch;
+  const std::uint64_t needed = toks_scratch_bytes(toks_->ctx, text.size(), 0);
+  if (needed == 0) return false;
+  if (scratch.size() < needed) {
+    scratch.assign(needed, 0);
+    if (toks_scratch_init(toks_->ctx, scratch.data(), scratch.size(), 0) != 0) {
+      scratch.clear();
+      return false;
+    }
+  }
+  const std::size_t base = ids.size();
+  const std::uint64_t cap = toks_encode_bound(toks_->ctx, text.size());
+  ids.resize(base + cap);
+  // Added tokens are already cut out by encode_special, and the ids of a span never depend on the next span.
+  const std::int64_t n = toks_encode(toks_->ctx, text.data(), text.size(),
+                                     TOKS_ADDED_NONE | TOKS_NO_POSTPROCESS | TOKS_NO_TRUNCATE | TOKS_NO_PAD |
+                                         TOKS_CONTINUATION,
+                                     reinterpret_cast<std::uint32_t*>(ids.data() + base), cap, scratch.data());
+  if (n < 0) {
+    ids.resize(base);
+    return false;
+  }
+  ids.resize(base + static_cast<std::size_t>(n));
+  return true;
+}
+#endif
 
 }  // namespace ingine::text

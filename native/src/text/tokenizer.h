@@ -7,6 +7,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
+#include <memory>
 #include <optional>
 #include <span>
 #include <string>
@@ -15,6 +16,9 @@
 #include <vector>
 
 namespace ingine::text {
+
+// Optional toks encoder (INGINE_WITH_TOKS); defined in tokenizer.cpp, never in this header.
+struct ToksBackend;
 
 struct AddedToken {
   int32_t id = -1;
@@ -97,6 +101,9 @@ class Tokenizer {
   Tokenizer() = default;
   void encode_ordinary(std::string_view text, std::vector<int32_t>& ids) const;
   void encode_piece(std::string_view piece, std::vector<int32_t>& ids) const;
+#ifdef INGINE_WITH_TOKS
+  bool toks_ordinary(std::string_view text, std::vector<int32_t>& ids) const;
+#endif
 
   std::vector<std::string> token_bytes_;  // raw bytes per id (added tokens: their content)
   std::vector<bool> special_;
@@ -108,6 +115,9 @@ class Tokenizer {
   std::vector<AddedToken> added_tokens_;
   std::array<std::vector<std::size_t>, 256> added_candidates_;  // by first byte, longest content first
   std::unordered_map<std::string, int32_t> added_by_content_;
+#ifdef INGINE_WITH_TOKS
+  std::shared_ptr<ToksBackend> toks_;  // null when toks could not load the file: native encoding only
+#endif
 };
 
 }  // namespace ingine::text
