@@ -117,6 +117,40 @@ INGINE_CTX=131072
 `INGINE_MODEL_DIR` must hold the pinned revision; this checks it without downloading:
 `.tools/venv/bin/python scripts/download_model.py --model-dir "$INGINE_MODEL_DIR" --verify-only`.
 
+## Optional: toks tokenizer (this fork)
+
+The `toks-encoder` branch can encode the ordinary BPE spans with [toks](https://github.com/actual-computer/toks)
+instead of the built-in matcher. Everything else stays native: added-token recognition, the `TokenBoundary`
+bookkeeping the prefix cache depends on, decoding and the chat template. Invalid UTF-8 is still rejected, and a
+tokenizer file toks cannot load, or any encode error, falls back to the built-in encoder.
+
+Build it with a [toks](https://github.com/actual-computer/toks) checkout beside this one:
+
+```
+make -C ../toks lib            # clang; use make CC=clang-18 lib where only a versioned clang is installed
+cmake -B native/build-install -S native \
+  -DINGINE_WITH_TOKS=ON -DTOKS_ROOT="$PWD/../toks" \
+  -DTOKS_LIBRARY="$PWD/../toks/build/linux-x86_64/libtoks.a"
+cmake --build native/build-install -j
+ingine stop && ingine start
+```
+
+The library is linked statically, so the server has no `libtoks.so` to find at run time. Leave
+`INGINE_WITH_TOKS` unset (the default) for the unmodified upstream behaviour.
+
+Measured on an RTX 5090 host (AVX2 tier) with Inkling's own tokenizer on 343 KB of C++ through the serving path
+`encode(text, special=true)`:
+
+| Encoder | Time | Tokens/s |
+|---------|------|----------|
+| built-in | 19.889 ms | 6.6 M |
+| toks | 3.307 ms | 39.9 M |
+
+Ids are byte-identical to the built-in encoder on that corpus and on 36 differential cases (random unicode and
+special-token soup, CUDA sources, a 200 KB single line, empty input); the `text_*` test suites pass unchanged.
+The saving is about 16.6 ms per 132k uncached prompt tokens, 4 ms at 30k — a latency trim on long prompts, not a
+throughput change.
+
 ## Connect an application
 
 Use the OpenAI-compatible API at **`http://127.0.0.1:8003/v1`**, model **`inkling-2-mini-abliterated`**
