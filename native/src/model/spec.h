@@ -2,7 +2,7 @@
 //
 // Per round: the drafter proposes 7 tokens after the anchor (the last sampled, not yet processed token at
 // position P); only the leading drafts whose confidence (max softmax probability) exceeds
-// options.spec_threshold are verified, in the smallest verify width of {2, 4, 8} holding anchor + them; the
+// options.spec_threshold are verified, in the smallest verify width of {2..8} holding anchor + them; the
 // verify call runs the target's decode step of that width (history + taps); acceptance is the longest
 // prefix equal to the target argmax (greedy) or speculative rejection sampling against the drafts' own
 // distributions (sampled, exact for the target's distribution); rejected rows are rolled back (conv states

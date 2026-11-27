@@ -58,8 +58,11 @@ struct Totals {
   }
 };
 
-int oracle_width(int run) {  // the smallest verify width holding the anchor and `run` drafts
-  return run + 1 <= 2 ? 2 : (run + 1 <= 4 ? 4 : 8);
+int oracle_width(int run, const Totals& all) {  // the smallest active verify width holding the anchor and `run` drafts
+  const int need = std::clamp(run + 1, 1, WIDTHS - 1);
+  for (int w = need; w < WIDTHS; ++w)
+    if (all.width_rounds[w]) return w;
+  return WIDTHS - 1;
 }
 
 // Oracle and verify-all estimates for rounds `tr` priced with the measured verify ms per width of `all`
@@ -73,7 +76,7 @@ void estimates(const Totals& t, const Totals& all, const std::vector<model::Spec
   double o_ms = 0, a_ms = 0, o_tok = 0, a_tok = 0;
   for (const auto& r : tr) {
     const double base = overhead_ms + r.draft_ms;
-    o_ms += base + vms(oracle_width(r.accepted_all));
+    o_ms += base + vms(oracle_width(r.accepted_all, all));
     o_tok += r.accepted_all + 1;
     a_ms += base + vms(8);
     a_tok += r.accepted_all + 1;
@@ -90,9 +93,10 @@ void print_totals(const char* name, const Totals& t, const Totals& all, const st
     estimates(t, all, tr, oracle, all8);
     std::printf("  %5.2f tok/verify  first-rejected %4.1f%%  draft %.3f ms  verify %.3f ms  widths", double(t.round_tokens) / t.rounds,
                 100.0 * t.first_rejected / t.rounds, t.draft_ms / t.rounds, t.verify_ms / t.rounds);
-    for (int w = 2; w < WIDTHS; w *= 2)
-      std::printf(" %d:%4.1f%%/%.2ft", w, 100.0 * t.width_rounds[w] / t.rounds,
-                  t.width_rounds[w] ? double(t.width_tokens[w]) / t.width_rounds[w] : 0.0);
+    for (int w = 1; w < WIDTHS; ++w)
+      if (t.width_rounds[w])
+        std::printf(" %d:%4.1f%%/%.2ft", w, 100.0 * t.width_rounds[w] / t.rounds,
+                    double(t.width_tokens[w]) / t.width_rounds[w]);
     std::printf("  oracle-width %.1f tok/s (%.2f tok/verify), verify-all %.1f tok/s", oracle,
                 double(t.oracle_tokens) / t.rounds, all8);
   }
@@ -111,7 +115,8 @@ nlohmann::ordered_json to_json(const Totals& t, const Totals& all, const std::ve
     j["first_rejected"] = double(t.first_rejected) / t.rounds;
     j["draft_ms"] = t.draft_ms / t.rounds;
     j["verify_ms"] = t.verify_ms / t.rounds;
-    for (int w = 2; w < WIDTHS; w *= 2) {
+    for (int w = 1; w < WIDTHS; ++w) {
+      if (!t.width_rounds[w] && w != 2 && w != 4 && w != 8) continue;
       j["width_share"][std::to_string(w)] = double(t.width_rounds[w]) / t.rounds;
       j["width_tokens_per_verify"][std::to_string(w)] =
           t.width_rounds[w] ? double(t.width_tokens[w]) / t.width_rounds[w] : 0.0;

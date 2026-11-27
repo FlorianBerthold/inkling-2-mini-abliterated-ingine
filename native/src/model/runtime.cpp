@@ -13,7 +13,15 @@ namespace ingine::model {
 namespace {
 
 constexpr int kMaxWidth = 8;
-constexpr std::array<int, 3> kVerifyWidths = {2, 4, 8};
+constexpr std::array<int, 7> kVerifyWidths = {2, 3, 4, 5, 6, 7, 8};
+
+cudaStream_t make_high_priority_stream() {
+  int lo = 0, hi = 0;
+  CUDA_CHECK(cudaDeviceGetStreamPriorityRange(&lo, &hi));
+  cudaStream_t s = nullptr;
+  CUDA_CHECK(cudaStreamCreateWithPriority(&s, cudaStreamNonBlocking, hi));
+  return s;
+}
 
 DeviceBuffer device_copy(const Tensor& t, cudaStream_t stream) {
   DeviceBuffer b(t.bytes());
@@ -63,7 +71,7 @@ void GraphExec::launch(cudaStream_t stream) const {
 
 Runtime::Runtime(const RuntimeOptions& options) : options_(options) {
   if (options.max_ctx < 16) throw std::invalid_argument("max_ctx must be at least 16");
-  CUDA_CHECK(cudaStreamCreateWithFlags(&stream_, cudaStreamNonBlocking));
+  stream_ = make_high_priority_stream();
   weights_ = load_weights(options.model_dir, options.dense_fp8, stream_);
   ablation_ = load_ablation(options.ablation);
   init();
@@ -72,7 +80,7 @@ Runtime::Runtime(const RuntimeOptions& options) : options_(options) {
 Runtime::Runtime(const RuntimeOptions& options, Weights weights, Ablation ablation)
     : options_(options), weights_(std::move(weights)), ablation_(std::move(ablation)) {
   if (options.max_ctx < 16) throw std::invalid_argument("max_ctx must be at least 16");
-  CUDA_CHECK(cudaStreamCreateWithFlags(&stream_, cudaStreamNonBlocking));
+  stream_ = make_high_priority_stream();
   init();
 }
 

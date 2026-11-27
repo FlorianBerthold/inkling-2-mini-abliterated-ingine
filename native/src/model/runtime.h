@@ -110,9 +110,9 @@ class Runtime {
   State& state() { return state_; }
   const State& state() const { return state_; }
 
-  // Call widths available: {1}, or {1, 2, 4, 8} with options.spec.
+  // Call widths available: {1}, or {1..8} with options.spec.
   bool has_width(int m) const;
-  std::span<const int> verify_widths() const;  // {2, 4, 8} with spec, else empty
+  std::span<const int> verify_widths() const;  // {2..8} with spec, else empty
   Buffers& buffers(int m);
   std::int64_t* pos() { return static_cast<std::int64_t*>(pos_.p); }
 

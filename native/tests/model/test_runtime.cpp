@@ -380,7 +380,7 @@ bool run(bool kv_fp8) {
           rt.record_rollback(m, static_cast<const std::int32_t*>(accepted.p), cs);
         });
     const int P = 1018;  // rows cross the ring wrap
-    for (auto [m, acc] : {std::pair{8, 2}, std::pair{4, 3}, std::pair{2, 0}}) {
+    for (auto [m, acc] : {std::pair{8, 2}, std::pair{5, 2}, std::pair{4, 3}, std::pair{3, 1}, std::pair{2, 0}}) {
       auto prologue = [&] {
         reset_state(rt.state(), s);
         for (int i = 0; i < 2; ++i) rt.decode_logits(toks[7 - i], P - 2 + i);
@@ -489,7 +489,7 @@ bool run(bool kv_fp8) {
     const std::int32_t d[7] = {101, 102, 103, 104, 105, 106, 107};
     INGINE_TEST_CUDA(cudaMemcpy(drafts.p, d, sizeof d, cudaMemcpyHostToDevice));
     bool sel_ok = true;
-    for (auto [lead, want] : {std::pair{0, 2}, std::pair{1, 2}, std::pair{2, 4}, std::pair{4, 8}, std::pair{7, 8}}) {
+    for (auto [lead, want] : {std::pair{0, 2}, std::pair{1, 2}, std::pair{2, 3}, std::pair{4, 5}, std::pair{7, 8}}) {
       float c[7];
       for (int i = 0; i < 7; ++i) c[i] = i < lead ? 0.9f : (i == lead ? 0.8f : 0.95f);  // 0.8 is not > 0.8
       INGINE_TEST_CUDA(cudaMemcpy(conf.p, c, sizeof c, cudaMemcpyHostToDevice));
@@ -509,7 +509,7 @@ bool run(bool kv_fp8) {
     }
     ok &= report(sel_ok, "verify_select picks the width of leads 0/1/2/4/7 and copies the drafts" + tag);
     bool none_ok = true;
-    for (auto [m, want] : {std::pair{4, 4}, std::pair{5, 0}}) {
+    for (auto [m, want] : {std::pair{4, 4}, std::pair{9, 0}}) {
       INGINE_TEST_CUDA(cudaMemset(marker.p, 0, 4));
       INGINE_TEST_CUDA(cudaMemcpy(m_in.p, &m, 4, cudaMemcpyHostToDevice));
       INGINE_TEST_CUDA(cudaDeviceSynchronize());

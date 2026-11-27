@@ -14,6 +14,7 @@
 //           queries (the probabilities, transposed through shared memory), 8 mma.
 // About 350 warp instructions per tile (8 KB of BF16 rows), where the CUDA-core kernel this replaces took
 // 0.5 per byte and was compute bound (64K keys: 305 us for 268 MB; local layers: 10 us for 4 MB).
+#include "kernels/common/l2.cuh"
 #include "kernels/draft/draft.h"
 #include "kernels/draft/draft_device.cuh"
 
@@ -69,15 +70,43 @@ __device__ __forceinline__ void ldmatrix_x2(uint32_t (&r)[2], const void* row) {
 }
 
 // 16-byte coherent load issued where it is written (queries and cache rows are written by earlier kernels).
-// The caches are read once per draft: no L1 allocation.
-__device__ __forceinline__ uint4 ld_cache(const void* p) {
+// The caches are read once per draft: no L1 allocation, 256B L2 sector prefetch, and evict-first so the
+// drafter's global ring does not thrash L2 ahead of the next verify step.
+constexpr l2::Evict KV_L2 = l2::Evict::first;
+
+__device__ __forceinline__ uint4 ld_cache(const void* p, std::uint64_t pol) {
   uint4 r;
-  asm volatile("ld.global.L1::no_allocate.v4.u32 {%0,%1,%2,%3}, [%4];"
-               : "=r"(r.x), "=r"(r.y), "=r"(r.z), "=r"(r.w)
-               : "l"(p)
-               : "memory");
+  if constexpr (l2::hinted<KV_L2>)
+    asm volatile("ld.global.L1::no_allocate.L2::256B.L2::cache_hint.v4.u32 {%0,%1,%2,%3}, [%4], %5;"
+                 : "=r"(r.x), "=r"(r.y), "=r"(r.z), "=r"(r.w)
+                 : "l"(p), "l"(pol)
+                 : "memory");
+  else
+    asm volatile("ld.global.L1::no_allocate.L2::256B.v4.u32 {%0,%1,%2,%3}, [%4];"
+                 : "=r"(r.x), "=r"(r.y), "=r"(r.z), "=r"(r.w)
+                 : "l"(p)
+                 : "memory");
   return r;
 }
+__device__ __forceinline__ void cp16z(void* dst, const void* src, bool ok, std::uint64_t pol) {
+  const unsigned smem = static_cast<unsigned>(__cvta_generic_to_shared(dst));
+  const int n = ok ? 16 : 0;
+  if constexpr (l2::hinted<KV_L2>)
+    asm volatile("cp.async.cg.shared.global.L2::256B.L2::cache_hint [%0], [%1], 16, %2, %3;"
+                 :
+                 : "r"(smem), "l"(src), "r"(n), "l"(pol)
+                 : "memory");
+  else
+    asm volatile("cp.async.cg.shared.global.L2::256B [%0], [%1], 16, %2;" : : "r"(smem), "l"(src), "r"(n) : "memory");
+}
+__device__ __forceinline__ void cp4z(void* dst, const void* src, bool ok) {
+  const unsigned smem = static_cast<unsigned>(__cvta_generic_to_shared(dst));
+  const int n = ok ? 4 : 0;
+  asm volatile("cp.async.ca.shared.global [%0], [%1], 4, %2;" : : "r"(smem), "l"(src), "r"(n) : "memory");
+}
+// XOR-swizzled column index (in BF16 elements) for 16-byte chunk `ch` (0..15) of row `key` (0..15): bank-conflict-free
+// ldmatrix reads and cp.async/staging writes.
+__device__ __forceinline__ int swiz_col(int key, int ch) { return (ch ^ (key & 7)) * 8; }
 
 // A tile's raw keys and values in registers (16 bytes per thread and load) and, in threads 0..15 of local
 // layers, the ring position of key t0 + thread.
@@ -99,10 +128,11 @@ __global__ void __launch_bounds__(ATT_THREADS) attn_partial_kernel(const __nv_bf
   constexpr int ROW_BYTES = FP8 ? HEAD_DIM : 2 * HEAD_DIM;
   constexpr int NL = TileRegs<FP8>::NL;
   __shared__ __align__(16) __nv_bfloat16 qs[QH][BLOCK][HEAD_DIM];    // the queries, by head
-  __shared__ __align__(16) __nv_bfloat16 kt[2][ATT_TILE][HEAD_DIM];  // keys of a tile, by tile parity
-  __shared__ __align__(16) __nv_bfloat16 vt[2][ATT_TILE][HEAD_DIM];  // values
+  __shared__ __align__(16) __nv_bfloat16 kt[2][ATT_TILE][HEAD_DIM];  // keys of a tile, XOR-swizzled, by tile parity
+  __shared__ __align__(16) __nv_bfloat16 vt[2][ATT_TILE][HEAD_DIM];  // values, XOR-swizzled
   __shared__ __align__(16) __nv_bfloat16 pt[QH][BLOCK][ATT_TILE];    // a head's probabilities [query][key]
   __shared__ unsigned vmask[2];                                      // valid keys of a tile
+  __shared__ int cpos_sm[2][ATT_TILE];                               // local ring positions staged via cp.async
   pdl_trigger();
   pdl_wait();
   const int chunk = blockIdx.x, g = blockIdx.y, tid = threadIdx.x, w = tid >> 5, lane = tid & 31;
@@ -111,16 +141,40 @@ __global__ void __launch_bounds__(ATT_THREADS) attn_partial_kernel(const __nv_bf
   const int P = p->P;
   const int kend = LOCAL ? k1 : min(k1, P + BLOCK);  // global: no valid key at or beyond P + 8
   constexpr float scale = 0.08838834764831845f;      // 1 / sqrt(128)
+  const std::uint64_t kvpol = l2::policy<KV_L2>();
 
-  auto load = [&](TileRegs<FP8>& x, int t0) {
+  auto issue_bf16 = [&](int buf, int t0) {
+    if (t0 < kend) {
+#pragma unroll
+      for (int j = 0; j < 2; ++j) {
+        const int idx = tid + ATT_THREADS * j;
+        const int key = idx >> 4, piece = idx & 15;
+        const int gkey = t0 + key;
+        const bool live = gkey < kend;
+        const size_t at = (size_t(gkey) * KV_HEADS + g) * ROW_BYTES + 16 * piece;
+        const int col = swiz_col(key, piece);
+        cp16z(&kt[buf][key][col], k_cache + (live ? at : 0), live, kvpol);
+        cp16z(&vt[buf][key][col], v_cache + (live ? at : 0), live, kvpol);
+      }
+      if constexpr (LOCAL) {
+        if (tid < ATT_TILE) {
+          const bool inr = t0 + tid < WINDOW;
+          cp4z(&cpos_sm[buf][tid], ctx_pos + (inr ? t0 + tid : 0), inr);
+        }
+      }
+    }
+    asm volatile("cp.async.commit_group;" ::: "memory");
+  };
+
+  auto load_fp8 = [&](TileRegs<FP8>& x, int t0) {
 #pragma unroll
     for (int j = 0; j < NL; ++j) {
       const int idx = tid + ATT_THREADS * j;
       const int key = t0 + idx / (ROW_BYTES / 16), piece = idx % (ROW_BYTES / 16);
       const size_t at = (size_t(key) * KV_HEADS + g) * ROW_BYTES + 16 * piece;
       const bool live = key < kend;
-      x.k[j] = live ? ld_cache(k_cache + at) : make_uint4(0, 0, 0, 0);
-      x.v[j] = live ? ld_cache(v_cache + at) : make_uint4(0, 0, 0, 0);
+      x.k[j] = live ? ld_cache(k_cache + at, kvpol) : make_uint4(0, 0, 0, 0);
+      x.v[j] = live ? ld_cache(v_cache + at, kvpol) : make_uint4(0, 0, 0, 0);
     }
     x.cp = 0;
     if constexpr (LOCAL) {
@@ -128,8 +182,13 @@ __global__ void __launch_bounds__(ATT_THREADS) attn_partial_kernel(const __nv_bf
     }
   };
   TileRegs<FP8> ra, rb;
-  if (k0 < kend) load(ra, k0);
-  if (k0 + ATT_TILE < kend) load(rb, k0 + ATT_TILE);
+  if constexpr (!FP8) {
+    issue_bf16(0, k0);
+    issue_bf16(1, k0 + ATT_TILE);
+  } else {
+    if (k0 < kend) load_fp8(ra, k0);
+    if (k0 + ATT_TILE < kend) load_fp8(rb, k0 + ATT_TILE);
+  }
 
   // the queries of heads 3 g + (0, 1, 2), rows 0..7
   {
@@ -159,53 +218,15 @@ __global__ void __launch_bounds__(ATT_THREADS) attn_partial_kernel(const __nv_bf
 #pragma unroll
     for (int i = 0; i < 4; ++i) oacc[d][i] = 0.f;
 
-  auto tile = [&](TileRegs<FP8>& x, int t0, int buf) {
-    // stage the tile as BF16 [16 keys][128]
-#pragma unroll
-    for (int j = 0; j < NL; ++j) {
-      const int idx = tid + ATT_THREADS * j;
-      const int key = idx / (ROW_BYTES / 16), piece = idx % (ROW_BYTES / 16);
-      if constexpr (FP8) {
-        const uint32_t kw[4] = {x.k[j].x, x.k[j].y, x.k[j].z, x.k[j].w}, vw[4] = {x.v[j].x, x.v[j].y, x.v[j].z, x.v[j].w};
-        uint32_t kb[8], vb[8];
-#pragma unroll
-        for (int i = 0; i < 4; ++i) {
-          kb[2 * i] = e4m3x2_to_bf16x2(kw[i]);
-          kb[2 * i + 1] = e4m3x2_to_bf16x2(kw[i] >> 16);
-          vb[2 * i] = e4m3x2_to_bf16x2(vw[i]);
-          vb[2 * i + 1] = e4m3x2_to_bf16x2(vw[i] >> 16);
-        }
-        uint4* kd = reinterpret_cast<uint4*>(&kt[buf][key][16 * piece]);
-        uint4* vd = reinterpret_cast<uint4*>(&vt[buf][key][16 * piece]);
-        kd[0] = make_uint4(kb[0], kb[1], kb[2], kb[3]);
-        kd[1] = make_uint4(kb[4], kb[5], kb[6], kb[7]);
-        vd[0] = make_uint4(vb[0], vb[1], vb[2], vb[3]);
-        vd[1] = make_uint4(vb[4], vb[5], vb[6], vb[7]);
-      } else {
-        *reinterpret_cast<uint4*>(&kt[buf][key][8 * piece]) = x.k[j];
-        *reinterpret_cast<uint4*>(&vt[buf][key][8 * piece]) = x.v[j];
-      }
-    }
-    if (w == 0) {
-      const int j = t0 + lane;
-      bool v = lane < ATT_TILE && j < kend;
-      if constexpr (LOCAL) {
-        if (j < WINDOW) v = v && x.cp >= 0 && x.cp < P && x.cp >= P - WINDOW;
-      }
-      const unsigned mask = __ballot_sync(0xffffffffu, v);
-      if (lane == 0) vmask[buf] = mask;
-    }
-    __syncthreads();
-    // these registers are free: the tile after the next one goes in flight (block-uniform condition)
-    if (t0 + 2 * ATT_TILE < kend) load(x, t0 + 2 * ATT_TILE);
+  auto consume = [&](int buf) {
     if (!head) return;
-
     // scores: keys gl (0, 1) and gl + 8 (2, 3) against queries 2 t, 2 t + 1
     float sc[4] = {0.f, 0.f, 0.f, 0.f};
 #pragma unroll
     for (int s = 0; s < HEAD_DIM / 16; ++s) {
       uint32_t a[4];
-      ldmatrix_x4(a, &kt[buf][8 * (lm & 1) + lr][16 * s + 8 * (lm >> 1)]);
+      const int r = 8 * (lm & 1) + lr;
+      ldmatrix_x4(a, &kt[buf][r][swiz_col(r, 2 * s + (lm >> 1))]);
       mma_bf16(sc, a, qb[s]);
     }
     const unsigned mask = vmask[buf];
@@ -254,13 +275,72 @@ __global__ void __launch_bounds__(ATT_THREADS) attn_partial_kernel(const __nv_bf
         oacc[d][3] *= al[1];
       }
       uint32_t a[4];
-      ldmatrix_x4_trans(a, &vt[buf][8 * (lm >> 1) + lr][16 * d + 8 * (lm & 1)]);
+      const int r = 8 * (lm >> 1) + lr;
+      ldmatrix_x4_trans(a, &vt[buf][r][swiz_col(r, 2 * d + (lm & 1))]);
       mma_bf16(oacc[d], a, pf);
     }
   };
-  for (int t0 = k0; t0 < kend; t0 += 2 * ATT_TILE) {
-    tile(ra, t0, 0);
-    if (t0 + ATT_TILE < kend) tile(rb, t0 + ATT_TILE, 1);
+
+  if constexpr (!FP8) {
+    for (int t0 = k0, buf = 0; t0 < kend; t0 += ATT_TILE, buf ^= 1) {
+      asm volatile("cp.async.wait_group 1;" ::: "memory");
+      if (w == 0) {
+        const int j = t0 + lane;
+        bool v = lane < ATT_TILE && j < kend;
+        if constexpr (LOCAL) {
+          if (v && j < WINDOW) {
+            const int cp = cpos_sm[buf][lane];
+            v = cp >= 0 && cp < P && cp >= P - WINDOW;
+          }
+        }
+        const unsigned mask = __ballot_sync(0xffffffffu, v);
+        if (lane == 0) vmask[buf] = mask;
+      }
+      __syncthreads();
+      consume(buf);
+      __syncthreads();
+      issue_bf16(buf, t0 + 2 * ATT_TILE);
+    }
+    asm volatile("cp.async.wait_all;" ::: "memory");
+  } else {
+    auto tile_fp8 = [&](TileRegs<FP8>& x, int t0, int buf) {
+      // stage the tile as XOR-swizzled BF16 [16 keys][128]
+#pragma unroll
+      for (int j = 0; j < NL; ++j) {
+        const int idx = tid + ATT_THREADS * j;
+        const int key = idx / (ROW_BYTES / 16), piece = idx % (ROW_BYTES / 16);
+        const uint32_t kw[4] = {x.k[j].x, x.k[j].y, x.k[j].z, x.k[j].w}, vw[4] = {x.v[j].x, x.v[j].y, x.v[j].z, x.v[j].w};
+        uint32_t kb[8], vb[8];
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+          kb[2 * i] = e4m3x2_to_bf16x2(kw[i]);
+          kb[2 * i + 1] = e4m3x2_to_bf16x2(kw[i] >> 16);
+          vb[2 * i] = e4m3x2_to_bf16x2(vw[i]);
+          vb[2 * i + 1] = e4m3x2_to_bf16x2(vw[i] >> 16);
+        }
+        *reinterpret_cast<uint4*>(&kt[buf][key][swiz_col(key, 2 * piece)]) = make_uint4(kb[0], kb[1], kb[2], kb[3]);
+        *reinterpret_cast<uint4*>(&kt[buf][key][swiz_col(key, 2 * piece + 1)]) = make_uint4(kb[4], kb[5], kb[6], kb[7]);
+        *reinterpret_cast<uint4*>(&vt[buf][key][swiz_col(key, 2 * piece)]) = make_uint4(vb[0], vb[1], vb[2], vb[3]);
+        *reinterpret_cast<uint4*>(&vt[buf][key][swiz_col(key, 2 * piece + 1)]) = make_uint4(vb[4], vb[5], vb[6], vb[7]);
+      }
+      if (w == 0) {
+        const int j = t0 + lane;
+        bool v = lane < ATT_TILE && j < kend;
+        if constexpr (LOCAL) {
+          if (j < WINDOW) v = v && x.cp >= 0 && x.cp < P && x.cp >= P - WINDOW;
+        }
+        const unsigned mask = __ballot_sync(0xffffffffu, v);
+        if (lane == 0) vmask[buf] = mask;
+      }
+      __syncthreads();
+      // these registers are free: the tile after the next one goes in flight (block-uniform condition)
+      if (t0 + 2 * ATT_TILE < kend) load_fp8(x, t0 + 2 * ATT_TILE);
+      consume(buf);
+    };
+    for (int t0 = k0; t0 < kend; t0 += 2 * ATT_TILE) {
+      tile_fp8(ra, t0, 0);
+      if (t0 + ATT_TILE < kend) tile_fp8(rb, t0 + ATT_TILE, 1);
+    }
   }
   if (!head) return;
 

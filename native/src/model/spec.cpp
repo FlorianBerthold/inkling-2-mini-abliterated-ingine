@@ -26,7 +26,7 @@ static_assert(sizeof(VerifyRecord::drafts) / sizeof(std::int32_t) == kd::GAMMA);
 
 Widths verify_widths(const Runtime& rt) {
   const std::span<const int> w = rt.verify_widths();
-  if (w.empty() || w.size() > 3) throw std::invalid_argument("SpecLoop: the runtime has no verify widths (spec off)");
+  if (w.empty() || w.size() > 8) throw std::invalid_argument("SpecLoop: the runtime has no verify widths (spec off)");
   Widths r;
   r.n = int(w.size());
   std::copy(w.begin(), w.end(), r.w);

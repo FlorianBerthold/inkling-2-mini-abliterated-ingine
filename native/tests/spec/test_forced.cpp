@@ -76,9 +76,9 @@ int main() {
     for (const auto& r : st.spec_trace) traced += r.accepted;
     bool sane = st.spec_trace.size() == std::size_t(st.spec_rounds) && traced == st.spec_accepted;
     for (const auto& r : st.spec_trace)
-      sane &= (r.width == 2 || r.width == 4 || r.width == 8) && r.accepted < r.width && r.accepted <= r.accepted_all &&
+      sane &= (r.width >= 2 && r.width <= 8) && r.accepted < r.width && r.accepted <= r.accepted_all &&
               (r.accepted_all == r.accepted || r.accepted == r.width - 1) && r.verify_ms > 0 && r.draft_ms > 0;
-    expect(sane, "trace: one record per round, widths 2/4/8, accepted <= accepted_all, timings");
+    expect(sane, "trace: one record per round, widths 2..8, accepted <= accepted_all, timings");
     // a forced output the model would not produce: every token emitted as given
     std::vector<std::int32_t> other(greedy_out.rbegin(), greedy_out.rend());
     forced.forced = other;

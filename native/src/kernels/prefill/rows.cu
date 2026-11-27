@@ -231,16 +231,47 @@ __device__ __forceinline__ void block_sum(float (&v)[N]) {
 
 __device__ __forceinline__ float dot4(float4 a, float4 b) { return a.x * b.x + a.y * b.y + a.z * b.z + a.w * b.w; }
 
-__global__ void __launch_bounds__(ROW_T) gate_inputs_kernel(const GateRows rows, int T, uint16_t* __restrict__ gin) {
-  const int t = blockIdx.x, g = blockIdx.y, c = threadIdx.x * 4;
-  const float4 h = *reinterpret_cast<const float4*>(rows.h[g] + size_t(t) * H + c);
-  const float4 m = *reinterpret_cast<const float4*>(rows.msg[g] + size_t(t) * H + c);
-  float ss[2] = {dot4(h, h), dot4(m, m)};
-  block_sum(ss);
-  const float rh = rsqrtf(ss[0] * (1.f / H) + kEps), rm = rsqrtf(ss[1] * (1.f / H) + kEps);
+// 192 threads = 6 warps x 3 quads for 8 CTAs/SM (100% occupancy on sm_120) while preserving bit-exact
+// 18-reference-warp reduction order.
+constexpr int GI_T = 192;
+constexpr int GI_W = GI_T / 32;
+constexpr int GI_V = ROW_W / GI_W;
+static_assert(GI_V * GI_W == ROW_W);
+
+__global__ void __launch_bounds__(GI_T) gate_inputs_kernel(const __grid_constant__ GateRows rows, int T,
+                                                           uint16_t* __restrict__ gin) {
+  const int t = blockIdx.x, g = blockIdx.y, tid = threadIdx.x;
+  const int lane = tid & 31, warp = tid >> 5;
+  __shared__ float red[ROW_W][2];
+  float4 h[GI_V], m[GI_V];
+#pragma unroll
+  for (int u = 0; u < GI_V; ++u) {
+    const int c = 4 * (tid + u * GI_T);
+    h[u] = *reinterpret_cast<const float4*>(rows.h[g] + size_t(t) * H + c);
+    m[u] = *reinterpret_cast<const float4*>(rows.msg[g] + size_t(t) * H + c);
+    const float sh = warp_sum(dot4(h[u], h[u]));
+    const float sm = warp_sum(dot4(m[u], m[u]));
+    if (lane == 0) {
+      red[warp + u * GI_W][0] = sh;
+      red[warp + u * GI_W][1] = sm;
+    }
+  }
+  __syncthreads();
+  float sh = 0.f, sm = 0.f;
+  if (lane == 0) {
+#pragma unroll
+    for (int w = 0; w < ROW_W; ++w) sh += red[w][0], sm += red[w][1];
+  }
+  sh = __shfl_sync(0xffffffffu, sh, 0);
+  sm = __shfl_sync(0xffffffffu, sm, 0);
+  const float rh = rsqrtf(sh * (1.f / H) + kEps), rm = rsqrtf(sm * (1.f / H) + kEps);
   uint16_t* o = gin + (size_t(g) * T + t) * 2 * H;
-  store_bf16x4(o + c, {h.x * rh, h.y * rh, h.z * rh, h.w * rh});
-  store_bf16x4(o + H + c, {m.x * rm, m.y * rm, m.z * rm, m.w * rm});
+#pragma unroll
+  for (int u = 0; u < GI_V; ++u) {
+    const int c = 4 * (tid + u * GI_T);
+    store_bf16x4(o + c, {h[u].x * rh, h[u].y * rh, h[u].z * rh, h[u].w * rh});
+    store_bf16x4(o + H + c, {m[u].x * rm, m[u].y * rm, m[u].z * rm, m[u].w * rm});
+  }
 }
 
 __global__ void __launch_bounds__(ROW_T) gate_apply_kernel(const float* __restrict__ h, const float* __restrict__ msg,
@@ -350,7 +381,7 @@ void conv_state_update(float* state, const __nv_bfloat16* x, int ld, int T, int 
 }
 
 void gate_inputs(const GateRows& rows, int G, int T, __nv_bfloat16* gin, cudaStream_t stream) {
-  gate_inputs_kernel<<<dim3(T, G), ROW_T, 0, stream>>>(rows, T, reinterpret_cast<uint16_t*>(gin));
+  gate_inputs_kernel<<<dim3(T, G), GI_T, 0, stream>>>(rows, T, reinterpret_cast<uint16_t*>(gin));
 }
 
 void gate_apply(const float* h, const float* msg, const float* f, const float* g, const float* norm_w, int T,

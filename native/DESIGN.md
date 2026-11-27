@@ -224,7 +224,7 @@ next step). `RuntimeOptions::vision` (ingine-serve: on unless `--no-vision`) loa
 `Drafter` mirrors `dspark.Drafter` (`draft(anchor, P, temperature) -> tokens[7], logits[7, V]`,
 `commit(feats [n,4,H], start)`, graphs per context bucket and one for small commits). `SpecLoop::generate(...)`
 mirrors `engine.Engine._generate_spec` and is called by the Generator when `options.spec`. It uses the
-runtime's decode graphs for widths 2, 4 and 8 (history + taps on): the verify width is chosen on the device
+runtime's decode graphs for widths 2..8 (history + taps on): the verify width is chosen on the device
 from the draft's confidences (a CUDA graph with a switch node over the widths: backup, decode), a second
 switch graph accepts and rolls back, and a third (`Drafter::advance`, per context bucket) commits the
 accepted rows and drafts for the next anchor from device values, so a round and the next draft are launched
